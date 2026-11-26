@@ -1,0 +1,29 @@
+{
+ "name": "EP Tracker (TEST)",
+ "short_name": "EP Tracker",
+ "id": "./",
+ "start_url": "./",
+ "scope": "./",
+ "display": "standalone",
+ "background_color": "#e7e4df",
+ "theme_color": "#141210",
+ "description": "Test copy of the EP Tracker with fictitious data, kept on this device.",
+ "icons": [
+  {
+   "src": "icon-192.png",
+   "sizes": "192x192",
+   "type": "image/png"
+  },
+  {
+   "src": "icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png"
+  },
+  {
+   "src": "icon-maskable-512.png",
+   "sizes": "512x512",
+   "type": "image/png",
+   "purpose": "maskable"
+  }
+ ]
+}
