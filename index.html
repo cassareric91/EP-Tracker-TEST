@@ -3577,7 +3577,12 @@ showView(viewFromHash(), false);
   SY.subscribe(function (i) { if (i.state === "needs-permission" && !window.__eptAsked) { window.__eptAsked = true; note("Press Reconnect OneDrive at the top to keep this computer in sync."); } });
 
   /* offline files when served from a web address */
-  if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () {}); });
+  if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
+    // when a newer version takes over, reload once so it shows straight away
+    var had = !!navigator.serviceWorker.controller, again = false;
+    navigator.serviceWorker.addEventListener("controllerchange", function () { if (had && !again) { again = true; location.reload(); } });
+    window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(function (r) { r.update().catch(function () {}); }).catch(function () {}); });
+  }
 })();
 
 </script>
