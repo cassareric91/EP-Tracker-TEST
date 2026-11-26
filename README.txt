@@ -28,8 +28,21 @@ The tracker's menu (three dots, top right)
   Install / Uninstall    install it, or the steps to remove it
   Erase all data         empties the tracker on this device
 
-Each device keeps its own copy. To move your work between devices, Export on one and Import on
-the other. This copy has nothing to do with the real EP Tracker on claude.ai.
+Same information on all your computers (OneDrive sync)
+  Needs Chrome or Microsoft Edge on each computer, and the OneDrive app signed in.
+  1. On the first computer: press the OneDrive button at the top (or menu > OneDrive sync),
+     choose "Create the shared file" and save it in your OneDrive folder, e.g. OneDrive > EP Tracker.
+  2. On every other computer: open the app, OneDrive button > "Connect to the shared file",
+     and pick that same file in the OneDrive folder.
+  From then on every change is saved to the file and the other computers show it within a few
+  seconds of OneDrive syncing. Edits made on two computers at the same time are merged; if both
+  changed the very same field, the last one saved wins.
+  After restarting the browser, press "Reconnect OneDrive" once (choose "Allow on every visit"
+  if the browser offers it). Phones can't use the OneDrive folder; on a phone the app keeps its
+  own copy (move data with Export/Import).
+  Tip: in OneDrive, right-click the EP Tracker folder > "Always keep on this device".
+
+This copy has nothing to do with the real EP Tracker on claude.ai.
 
 Updating: replace index.html and sw.js in the repository with the new ones, then open the app
 once while online.

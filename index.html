@@ -23,6 +23,12 @@
 .sa-dlg .msg.err{color:var(--bad)}
 .sa-dlg .acts{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:14px}
 .sa-steps{margin:10px 0;padding-left:22px;display:grid;gap:6px;font-size:14px}
+.sa-sync{display:flex;align-items:center;gap:6px;border:1px solid color-mix(in srgb,var(--bg) 25%,transparent);background:none;color:inherit;border-radius:8px;padding:5px 10px;min-height:36px;cursor:pointer;font-size:13px;white-space:nowrap}
+.sa-sync svg{width:18px;height:18px;flex:none}
+.sa-sync:hover{background:color-mix(in srgb,var(--bg) 14%,transparent)}
+.sa-sync[data-state=on] svg{color:#62c48f}
+.sa-sync[data-state=needs-permission],.sa-sync[data-state=error]{background:#e5251d;border-color:#e5251d;color:#fff}
+@media (max-width:760px),(pointer:coarse) and (max-width:1100px){.sa-sync{padding:5px 8px}.sa-sync span{display:none}.sa-sync[data-state=needs-permission] span{display:inline}}
 .sa-warn{margin-top:12px;border:1px solid color-mix(in srgb,var(--bad) 35%,var(--rule));border-radius:8px;padding:10px 12px;display:grid;gap:4px;justify-items:start}
 </style>
 <script>
@@ -57,7 +63,96 @@ window.EPT_STANDALONE = true;
 
   /* ---------- change notification ---------- */
   var dirty = new Set(), flushing = false;
-  function touched(col) { dirty.add(col); save(); if (!flushing) { flushing = true; setTimeout(flush, 0); } }
+  function touched(col, remote) { dirty.add(col); save(); if (!remote) SYNC.changed(); if (!flushing) { flushing = true; setTimeout(flush, 0); } }
+
+  /* ---------- OneDrive sync: one shared JSON file in the OneDrive folder, kept up to date by the OneDrive app ----------
+     Every local change is written to the file; the file is checked every few seconds and changes made on other
+     computers are merged in (three-way, against the last version both sides agreed on, so edits to different
+     EPs, jobs or fields on two computers both survive; when the same field was changed on both, this computer's wins). */
+  var same = function (a, b) { return JSON.stringify(a) === JSON.stringify(b); };
+  function merge3(base, mine, theirs) {
+    if (same(mine, theirs)) return clone(mine);
+    if (same(mine, base)) return clone(theirs);
+    if (same(theirs, base)) return clone(mine);
+    if (isObj(mine) && isObj(theirs)) {
+      var b = isObj(base) ? base : {}, o = {}, keys = new Set(Object.keys(mine).concat(Object.keys(theirs)));
+      keys.forEach(function (k) { var v = merge3(b[k], mine[k], theirs[k]); if (v !== undefined) o[k] = v; });
+      return o;
+    }
+    return clone(mine);
+  }
+  var SYNC = (function () {
+    var S = { handle: null, name: "", state: "off", base: null, known: 0, lastSync: null, error: "", device: "", busy: Promise.resolve(), timer: null, poll: null, dirty: false };
+    try { S.device = localStorage.getItem("ept-device") || ""; if (!S.device) { S.device = "d_" + newId().slice(0, 10); localStorage.setItem("ept-device", S.device); } } catch (e) { S.device = "d_" + newId().slice(0, 10); }
+    var supported = typeof window.showSaveFilePicker === "function" && typeof window.showOpenFilePicker === "function";
+    var subs = [];
+    function emit() { subs.forEach(function (f) { try { f(info()); } catch (e) {} }); }
+    function info() { return { supported: supported, state: S.state, name: S.name, lastSync: S.lastSync, error: S.error }; }
+    function set(st, e) { S.state = st; S.error = e || ""; emit(); }
+    function q(fn) { S.busy = S.busy.then(fn, fn).catch(function (e) { set("error", (e && e.message) || "Sync failed"); }); return S.busy; }
+    async function perm(ask) { var o = { mode: "readwrite" }; if ((await S.handle.queryPermission(o)) === "granted") return true; if (!ask) return false; return (await S.handle.requestPermission(o)) === "granted"; }
+    function payload() { return JSON.stringify({ format: "ep-tracker-test-data", version: 1, savedAt: new Date().toISOString(), savedBy: S.device, collections: tree }); }
+    async function readFile() { var f = await S.handle.getFile(); var t = await f.text(); return { mod: f.lastModified, data: t.trim() ? JSON.parse(t) : null }; }
+    async function writeFile() { var w = await S.handle.createWritable(); await w.write(payload()); await w.close(); var f = await S.handle.getFile(); S.known = f.lastModified; S.base = clone(tree); S.dirty = false; await kv("readwrite", function (s) { return s.put(S.base, "syncBase"); }); S.lastSync = new Date(); set("on"); }
+    // bring the file's changes in and send ours out
+    function apply(next) {
+      var cols = new Set(Object.keys(tree).concat(Object.keys(next)));
+      tree = next; cols.forEach(function (c) { if (!same((S.prevTree || {})[c], tree[c])) touched(c, true); });
+    }
+    async function check(force) {
+      if (!S.handle || S.state === "needs-permission") return;
+      var f; try { f = await S.handle.getFile(); } catch (e) { set("error", "The OneDrive file can't be reached. Is it still there?"); return; }
+      if (!force && f.lastModified === S.known && !S.dirty) return;
+      if (f.lastModified !== S.known) {
+        var r = JSON.parse((await f.text()) || "null");
+        if (r && r.format === "ep-tracker-test-data" && isObj(r.collections)) {
+          S.prevTree = clone(tree);
+          var merged = merge3(S.base || {}, tree, r.collections);
+          S.base = clone(r.collections); S.known = f.lastModified;
+          if (!same(merged, tree)) apply(merged);
+          S.dirty = S.dirty || !same(merged, r.collections);
+          await kv("readwrite", function (s) { return s.put(S.base, "syncBase"); });
+        }
+      }
+      if (S.dirty) await writeFile(); else { S.lastSync = new Date(); set("on"); }
+    }
+    function start() {
+      clearInterval(S.poll);
+      S.poll = setInterval(function () { if (document.visibilityState === "visible") q(function () { return check(false); }); }, 4000);
+      document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") q(function () { return check(false); }); });
+    }
+    return {
+      info: info, supported: supported, subscribe: function (f) { subs.push(f); f(info()); },
+      changed: function () { if (!S.handle) return; S.dirty = true; clearTimeout(S.timer); S.timer = setTimeout(function () { q(function () { return check(false); }); }, 800); },
+      // first run: pick up a file connected earlier on this computer
+      restore: async function () {
+        if (!supported) return;
+        try { S.handle = await kv("readonly", function (s) { return s.get("syncHandle"); }); S.base = await kv("readonly", function (s) { return s.get("syncBase"); }) || null; } catch (e) { S.handle = null; }
+        if (!S.handle) return; S.name = S.handle.name;
+        if (await perm(false)) { set("on"); start(); q(function () { return check(true); }); } else set("needs-permission");
+      },
+      reconnect: async function () { if (!S.handle) return; if (await perm(true)) { set("on"); start(); return q(function () { return check(true); }); } set("needs-permission", "Access to the file was not allowed."); },
+      // create the shared file from this computer's data
+      create: async function () {
+        var h = await window.showSaveFilePicker({ suggestedName: "EP Tracker TEST data.json", startIn: "documents", types: [{ description: "EP Tracker data", accept: { "application/json": [".json"] } }] });
+        S.handle = h; S.name = h.name; try { await kv("readwrite", function (s) { return s.put(h, "syncHandle"); }); } catch (e) {}
+        await q(writeFile); start();
+      },
+      // connect to a file another computer created: this computer takes the file's data
+      open: async function () {
+        var hs = await window.showOpenFilePicker({ startIn: "documents", types: [{ description: "EP Tracker data", accept: { "application/json": [".json"] } }] });
+        var h = hs[0], f = await h.getFile(), r = JSON.parse((await f.text()) || "null");
+        if (!r || r.format !== "ep-tracker-test-data" || !isObj(r.collections)) throw err("invalid_argument", "That file is not an EP Tracker (TEST) data file.");
+        return { name: h.name, eps: Object.keys(r.collections.eps || {}).length, go: async function () {
+          S.handle = h; S.name = h.name; try { await kv("readwrite", function (s) { return s.put(h, "syncHandle"); }); } catch (e) {}
+          tree = clone(r.collections); S.base = clone(r.collections); S.known = f.lastModified;
+          await kv("readwrite", function (s) { return s.put(S.base, "syncBase"); }); await saveNow();
+        } };
+      },
+      now: function () { return q(function () { return check(true); }); },
+      disconnect: async function () { clearInterval(S.poll); S.handle = null; S.name = ""; S.base = null; await kv("readwrite", function (s) { s.delete("syncHandle"); return s.delete("syncBase"); }); set("off"); }
+    };
+  })();
   function flush() { flushing = false; var cs = new Set(dirty); dirty.clear(); listeners.slice().forEach(function (l) { if (cs.has(l.col)) fire(l); }); }
   function fire(l) { if (l.dead) return; try { l.next(l.kind === "doc" ? docSnap(l.col, l.id) : runQuery(l.col, l.q)); } catch (e) { setTimeout(function () { throw e; }); } }
   function listen(l) { listeners.push(l); setTimeout(function () { fire(l); }, 0); return function () { l.dead = true; listeners = listeners.filter(function (x) { return x !== l; }); }; }
@@ -119,10 +214,11 @@ window.EPT_STANDALONE = true;
 
   /* ---------- user and downloads ---------- */
   var ME = "u_local";
+  try { ME = "u_" + (localStorage.getItem("ept-device") || "local"); } catch (e) {}
   var user = Object.freeze({
     id: function () { return Promise.resolve(ME); }, me: function () { return Promise.resolve({ id: ME, name: "You" }); },
     isOwner: function () { return Promise.resolve(true); }, canEdit: function () { return Promise.resolve(true); }, can: function () { return Promise.resolve(true); },
-    profiles: function (ids) { var o = {}; (ids || []).forEach(function (i) { o[i] = { id: i, name: i === ME ? "You" : "" }; }); return Promise.resolve(o); },
+    profiles: function (ids) { var o = {}; (ids || []).forEach(function (i) { o[i] = { id: i, name: i === ME ? "You (this computer)" : /^u_d_/.test(i) ? "Another computer" : "" }; }); return Promise.resolve(o); },
     search: function () { return Promise.resolve([]); }
   });
   function typeFor(n) { return /\.pdf$/i.test(n) ? "application/pdf" : /\.json$/i.test(n) ? "application/json" : /\.xlsx$/i.test(n) ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" : /\.xls$/i.test(n) ? "application/vnd.ms-excel" : /\.csv$/i.test(n) ? "text/csv" : "application/octet-stream"; }
@@ -141,6 +237,7 @@ window.EPT_STANDALONE = true;
     importData: function (j) { if (!j || j.format !== "ep-tracker-test-data" || !isObj(j.collections)) throw err("invalid_argument", "This is not an EP Tracker (TEST) data file."); tree = clone(j.collections); if (!tree.meta || !tree.meta["import-2020-2024"]) tree = merge(tree, KEEP); return saveNow(); },
     reset: function () { tree = clone(seed() || {}); return saveNow(); },
     erase: async function () {
+      await SYNC.disconnect(); // erasing this computer must never empty the shared OneDrive file
       pending = false; clearTimeout(saveTimer); tree = clone(KEEP);
       await saveNow();
       try { Object.keys(localStorage).forEach(function (k) { localStorage.removeItem(k); }); } catch (e) {}
@@ -148,7 +245,8 @@ window.EPT_STANDALONE = true;
       try { if (navigator.serviceWorker) { var rs = await navigator.serviceWorker.getRegistrations(); await Promise.all(rs.map(function (r) { return r.unregister(); })); } } catch (e) {}
     },
     counts: function () { var b = (tree.board || {}).main; return { eps: Object.keys(tree.eps || {}).length, jobs: b && b.jobs ? Object.keys(b.jobs).length : 0, items: Object.keys(tree.agenda_items || {}).length, sites: Object.keys(tree.sites || {}).length }; },
-    status: sayStatus
+    status: sayStatus,
+    sync: SYNC
   };
 
   /* ---------- start ---------- */
@@ -159,6 +257,7 @@ window.EPT_STANDALONE = true;
       else { tree = clone(seed() || KEEP); await saveNow(); }
     } catch (e) { storeOk = false; tree = clone(seed() || KEEP); }
     if (!tree.meta || !tree.meta["import-2020-2024"]) tree = merge(tree, KEEP);
+    SYNC.restore();
   })();
   var NS = { db: db, user: user, downloads: downloads };
   window.claude = Object.freeze({ use: function (name) { return ready.then(function () { return NS[name] || null; }); } });
@@ -3392,14 +3491,14 @@ showView(viewFromHash(), false);
         var j; try { j = JSON.parse(t); } catch (e) { return open("Import data", [p("That file could not be read. Pick a file made with <b>Export data</b>.", "err")], [btn("Close", function () { dlg.close(); }, "primary")]); }
         if (!j || j.format !== "ep-tracker-test-data" || !j.collections) return open("Import data", [p("That is not an EP Tracker (TEST) data file. Pick a file made with <b>Export data</b>.", "err")], [btn("Close", function () { dlg.close(); }, "primary")]);
         var c = j.collections, n = Object.keys(c.eps || {}).length, jb = c.board && c.board.main && c.board.main.jobs ? Object.keys(c.board.main.jobs).length : 0, ai = Object.keys(c.agenda_items || {}).length;
-        open("Replace this tracker?", [p("<b>" + f.name.replace(/[<>&]/g, "") + "</b> has " + n + " EPs, " + jb + " To-Do jobs and " + ai + " agenda items."), p("Everything currently in the tracker on this device is replaced. Export first if you want to keep it.")],
+        open("Replace this tracker?", [p("<b>" + f.name.replace(/[<>&]/g, "") + "</b> has " + n + " EPs, " + jb + " To-Do jobs and " + ai + " agenda items."), p("Everything currently in the tracker on this device is replaced" + (SY.info().state === "on" ? ", and on every computer synced through OneDrive" : "") + ". Export first if you want to keep it.")],
           [btn("Cancel", function () { dlg.close(); }), btn("Replace and reload", function () { X.importData(j).then(function () { location.reload(); }, function (e) { dlg.close(); note(e.message || "Import failed.", true); }); }, "primary")]);
       });
     });
     inp.click();
   }
   function resetData() {
-    open("Reset to sample data?", [p("The tracker goes back to the fictitious data it came with: 350 EPs (50 a year, 2020 to 2026), their To-Do jobs, agenda items and map sites."), p("Your changes on this device are lost. Export first if you want to keep them.")],
+    open("Reset to sample data?", [p("The tracker goes back to the fictitious data it came with: 350 EPs (50 a year, 2020 to 2026), their To-Do jobs, agenda items and map sites."), p((SY.info().state === "on" ? "This also resets every computer synced through OneDrive. " : "") + "Your changes are lost. Export first if you want to keep them.")],
       [btn("Cancel", function () { dlg.close(); }), btn("Reset and reload", function () { X.reset().then(function () { location.reload(); }); }, "primary")]);
   }
   function erase() {
@@ -3407,7 +3506,7 @@ showView(viewFromHash(), false);
       if (!go.dataset.arm) { go.dataset.arm = "1"; go.textContent = "Tap again to erase"; return; }
       X.erase().then(function () { location.reload(); });
     }, "danger solid");
-    open("Erase all data?", [p("This deletes every EP, To-Do job, agenda item, map site and setting stored on this device, plus the app's offline files. The tracker opens empty afterwards."), p("It cannot be undone. Use <b>Export data</b> first if you might want it back.")], [btn("Cancel", function () { dlg.close(); }), go]);
+    open("Erase all data?", [p("This deletes every EP, To-Do job, agenda item, map site and setting stored on this device, plus the app's offline files. The tracker opens empty afterwards." + (SY.info().state !== "off" ? " This computer is disconnected from OneDrive first, so the shared file and your other computers are not affected." : "")), p("It cannot be undone. Use <b>Export data</b> first if you might want it back.")], [btn("Cancel", function () { dlg.close(); }), go]);
   }
 
   /* install / uninstall */
@@ -3430,6 +3529,52 @@ showView(viewFromHash(), false);
       el("div", { class: "sa-warn" }, [el("b", { text: "Want the data gone too?" }), p("Uninstalling can leave the tracker's data stored in the browser. Erase it first if you don't plan to come back."), btn("Erase all data first", function () { dlg.close(); erase(); }, "danger")])];
     open("Uninstall EP Tracker (TEST)", body, [btn("Got it", function () { dlg.close(); }, "primary")]);
   }
+
+  /* OneDrive sync: status button in the top bar and its dialog */
+  var SY = X.sync, CLOUD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 18h10a4 4 0 0 0 .7-7.94A6 6 0 0 0 6.2 9.1 4.5 4.5 0 0 0 7 18z"/></svg>';
+  var sb = el("button", { type: "button", class: "sa-sync", id: "sa-sync", html: CLOUD + '<span id="sa-sync-t">OneDrive</span>' });
+  var wrap = $("menu-btn").closest(".menuwrap"); wrap.parentNode.insertBefore(sb, wrap);
+  sb.addEventListener("click", function () { if (SY.info().state === "needs-permission") SY.reconnect(); else syncDialog(); });
+  item("m-sync", "OneDrive sync", "Share this tracker with your other computers", syncDialog);
+  menu.insertBefore($("m-sync"), $("m-export"));
+  function hhmm(d) { return d ? String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") : ""; }
+  SY.subscribe(function (i) {
+    var t = $("sa-sync-t"); sb.dataset.state = i.state;
+    t.textContent = !i.supported ? "This device only" : i.state === "on" ? "Synced " + hhmm(i.lastSync) : i.state === "needs-permission" ? "Reconnect OneDrive" : i.state === "error" ? "Sync problem" : "Not synced";
+    sb.title = i.state === "on" ? "Synced with " + i.name + " in OneDrive" : i.error || "OneDrive sync";
+    if (dlg.open && dlg.dataset.k === "sync") syncDialog(true);
+  });
+  function syncDialog(refresh) {
+    var i = SY.info(), body = [], acts = [];
+    var close = btn("Close", function () { dlg.close(); });
+    if (!i.supported) {
+      body.push(p("Syncing needs <b>Chrome</b> or <b>Microsoft Edge</b> on a computer. This browser can't save to a OneDrive folder, so the tracker is kept on this device only."));
+      acts.push(close);
+    } else if (i.state === "off") {
+      body.push(p("Keep the tracker in a file in your <b>OneDrive</b> folder. Every computer connected to that file shows the same, up-to-date information. The OneDrive app carries the file between computers, and the tracker checks it every few seconds."),
+        el("ol", { class: "sa-steps", html: "<li><b>First computer:</b> Create the shared file, and save it in your OneDrive folder (for example <i>OneDrive › EP Tracker</i>). It starts with what is on this computer now.</li><li><b>Every other computer:</b> Connect to the shared file, and pick that same file in OneDrive. That computer then shows the file's data.</li>" }));
+      acts.push(close, btn("Connect to the shared file", connect), btn("Create the shared file", create, "primary"));
+    } else {
+      body.push(p("Shared file: <b>" + String(i.name).replace(/[<>&]/g, "") + "</b> in OneDrive."));
+      if (i.state === "on") body.push(p("In sync. Last checked " + hhmm(i.lastSync) + ". Changes made here are saved to the file straight away, and changes from your other computers appear within a few seconds of OneDrive bringing them over."));
+      if (i.state === "needs-permission") body.push(p("The browser needs your OK again to use the file (it asks after a restart). Press <b>Reconnect</b>; in the browser's question choose <b>Allow on every visit</b> if it offers it.", "err"));
+      if (i.state === "error") body.push(p(String(i.error).replace(/[<>&]/g, "") || "Something went wrong while syncing.", "err"));
+      acts.push(btn("Disconnect", function () { SY.disconnect().then(function () { note("Disconnected. This computer now keeps its own copy."); }); }), close);
+      acts.push(i.state === "needs-permission" ? btn("Reconnect", function () { SY.reconnect(); }, "primary") : btn("Sync now", function () { SY.now(); }, "primary"));
+    }
+    if (refresh === true) { dlg.querySelector(".sa-body").replaceChildren.apply(dlg.querySelector(".sa-body"), body); dlg.querySelector(".acts").replaceChildren.apply(dlg.querySelector(".acts"), acts); return; }
+    open("OneDrive sync", body.filter(Boolean), acts); dlg.dataset.k = "sync";
+  }
+  dlg.addEventListener("close", function () { delete dlg.dataset.k; });
+  function create() { SY.create().then(function () { dlg.close(); note("Shared file created. Now connect your other computers to it."); }, function (e) { if (e && e.name === "AbortError") return; note((e && e.message) || "The file could not be created.", true); }); }
+  function connect() {
+    SY.open().then(function (r) {
+      open("Use the shared file?", [p("<b>" + r.name.replace(/[<>&]/g, "") + "</b> holds " + r.eps + " EPs."), p("This computer will show the shared file's data from now on. What is on this computer now and not in the file is replaced, so use <b>Export data</b> first if you need it.")],
+        [btn("Cancel", function () { dlg.close(); }), btn("Connect and reload", function () { r.go().then(function () { location.reload(); }); }, "primary")]);
+    }, function (e) { if (e && e.name === "AbortError") return; note((e && e.message) || "The file could not be opened.", true); });
+  }
+  // remind about reconnecting after a browser restart
+  SY.subscribe(function (i) { if (i.state === "needs-permission" && !window.__eptAsked) { window.__eptAsked = true; note("Press Reconnect OneDrive at the top to keep this computer in sync."); } });
 
   /* offline files when served from a web address */
   if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () {}); });
